@@ -769,6 +769,10 @@ static bool findAngle(uint16_t nskip, uint16_t start, uint16_t end, float *angle
 
 	_pulseStart = findPulseLength(nskip, start);
 	_pulseEnd = findPulseLength(nskip, end);
+
+	if (_pulseStart >= 24000 || _pulseEnd >= 24000)
+		return false;
+
 	_pulseMid = (float) (_pulseStart + _pulseEnd) / 2;
 
 	/* 4000us -> 12000 ticks
@@ -828,6 +832,8 @@ static void ootx_add_bit(Lighthouse_OOTX_t *ootx, uint8_t bit)
 			/* first we'll need the length */
 			oPrivate->waiting_for_preamble = 0;
 			oPrivate->waiting_for_length = 1;
+			oPrivate->accumulator = 0;
+			oPrivate->accumulator_bits = 0;
 			return;
 		}
 		/* we've received 18 bits worth of preamble
@@ -840,7 +846,7 @@ static void ootx_add_bit(Lighthouse_OOTX_t *ootx, uint8_t bit)
 	}
 
 	/* we're receiving data!  accumulate until we get a sync bit */
-	if (oPrivate->accumulator_bits != 17)
+	if (oPrivate->accumulator_bits < 17)
 		return;
 
 	if ((oPrivate->accumulator & 0b1) == 0) {
@@ -862,7 +868,8 @@ static void ootx_add_word(Lighthouse_OOTX_t *ootx, uint16_t word)
 	Lighthouse_OOTX_Private_t *oPrivate = &ootx->private;
 
 	if (oPrivate->waiting_for_length) {
-		ootx->length = word + 4;	//add in the CRC32 length
+//		ootx->length = word + 4;	//add in the CRC32 length
+		ootx->length = (((word >> 8) & 0xFF) | ((word & 0xFF) << 8)) + 4;
 		oPrivate->padding = ootx->length & 1;
 		oPrivate->waiting_for_length = 0;
 		oPrivate->rx_bytes = 0;
@@ -895,7 +902,7 @@ static void pulse_init(Pulse_Buffer_t *buffer)
 
 static void pulse_write_rise(Pulse_Buffer_t *buffer, uint16_t time)
 {
-	if (!bitRead(buffer->head, 0)) {
+	if (bitRead(buffer->head, 0) == 0) {
 		buffer->timestamp[buffer->head] = time;
 		buffer->head = (buffer->head + 1) % PULSE_BUFSIZE;
 	}
@@ -904,7 +911,7 @@ static void pulse_write_rise(Pulse_Buffer_t *buffer, uint16_t time)
 
 static void pulse_write_fall(Pulse_Buffer_t *buffer, uint16_t time)
 {
-	if (bitRead(buffer->head, 0)) {
+	if (bitRead(buffer->head, 0) == 1) {
 		buffer->timestamp[buffer->head] = time;
 		buffer->head = (buffer->head + 1) % PULSE_BUFSIZE;
 	}
