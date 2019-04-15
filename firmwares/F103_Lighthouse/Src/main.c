@@ -42,8 +42,8 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdbool.h>
-#include <math.h>
 #include "stm_hal_serial.h"
+#include "Lighthouse_Sensor.h"
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
@@ -60,7 +60,6 @@ UART_HandleTypeDef huart3;
 /* Private variables ---------------------------------------------------------*/
 /* TODO Global Variables*/
 #define DEBUG				1
-#define TEST_INPUT_CAPTURE	0
 
 #if DEBUG
 
@@ -76,79 +75,9 @@ char vt100_lineX[DEBUG_LINE_MAX][16];
 
 #endif	//if DEBUG
 
-#define bitRead(value, bit) (((value) >> (bit)) & 0x01)
-#define bitSet(value, bit) ((value) |= (1UL << (bit)))
-#define bitClear(value, bit) ((value) &= ~(1UL << (bit)))
-#define bitWrite(value, bit, bitvalue) (bitvalue ? bitSet(value, bit) : bitClear(value, bit))
+Sensor_t sensor[4];
+volatile uint8_t sensor_pulse_detected[4];
 
-#if TEST_INPUT_CAPTURE==0
-
-const uint16_t pulse_data_max = 165;
-const uint16_t pulse_midpoints[8] = { 187, 219, 250, 281, 312, 345, 375, 405 };
-const uint16_t pulse_margin = 12;
-//const uint16_t pulse_data_max = 55;
-//const uint16_t pulse_midpoints[8] = { 62, 73, 83, 94, 104, 115, 125, 135 };
-//const uint16_t pulse_margin = 4;
-
-#define PULSE_BUFSIZE			100
-
-typedef struct
-{
-	volatile uint16_t timestamp[PULSE_BUFSIZE];
-	volatile uint16_t head;
-	volatile uint16_t tail;
-} Pulse_Buffer_t;
-
-#define ST_SWEEP_START_BIT			0
-#define ST_SWEEP_SKIP_SYNC_BIT		1
-#define ST_SWEEP_NSKIP_SYNC_BIT		2
-#define ST_SWEEP_GOT_DATA_BIT		3
-
-typedef struct
-{
-	uint8_t instance;
-	uint8_t id_tem;
-	Pulse_Buffer_t pulse;
-	float angles[4];
-	uint8_t state;
-	uint16_t startNskipPulse;
-	uint16_t startDataPulse;
-} Sensor_t;
-Sensor_t sensorL[4];
-
-#define OOTX_BUFSIZE		256
-
-typedef struct
-{
-	uint8_t waiting_for_preamble;
-	uint8_t waiting_for_length;
-	uint32_t accumulator;
-	uint16_t accumulator_bits;
-	uint16_t rx_bytes;
-	uint16_t padding;
-} Lighthouse_OOTX_Private_t;
-
-typedef struct
-{
-	uint8_t completed;
-	uint16_t length;
-	uint8_t bytes[OOTX_BUFSIZE];
-	Lighthouse_OOTX_Private_t private;
-} Lighthouse_OOTX_t;
-Lighthouse_OOTX_t ootx[4];
-#endif	//if TEST_INPUT_CAPTURE==0
-
-uint32_t ootx_reset_counter = 0;
-uint32_t ootx_error_counter = 0;
-uint32_t ootx_preamble_counter = 0;
-uint32_t pulse_invalid_counter = 0;
-
-#if TEST_INPUT_CAPTURE
-volatile uint32_t inputCaptureVal[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-volatile ITStatus inputCaptureFlag[8] = {RESET, RESET, RESET, RESET, RESET, RESET, RESET, RESET};
-#endif	//if TEST_INPUT_CAPTURE
-
-uint16_t errorCounter = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -164,27 +93,7 @@ static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 /* Private function prototypes -----------------------------------------------*/
 /* TODO Function Prototypes*/
-#if TEST_INPUT_CAPTURE==0
-static uint16_t findPulseLength(uint16_t start, uint16_t end);
-//static float findAngle(uint16_t nskip, uint16_t start, uint16_t end);
-static bool findAngle(uint16_t nskip, uint16_t start, uint16_t end, float *angle);
-static void sensor_init();
-static void sensorProcessing(Sensor_t *sensor);
-static void sensorHandler();
-
-static void pulse_init(Pulse_Buffer_t *buffer);
-static void pulse_write_rise(Pulse_Buffer_t *buffer, uint16_t time);
-static void pulse_write_fall(Pulse_Buffer_t *buffer, uint16_t time);
-static bool pulse_buffer_available(Pulse_Buffer_t *buffer);
-static bool pulse_read(Pulse_Buffer_t *buffer, uint16_t *rise, uint16_t *fall);
-
-static void ootx_init(Lighthouse_OOTX_t *ootx);
-static void ootx_reset(Lighthouse_OOTX_Private_t *ootxPrivate);
-static void ootx_add_bit(Lighthouse_OOTX_t *ootx, uint8_t bit);
-static void ootx_add_word(Lighthouse_OOTX_t *ootx, uint16_t word);
-
-#endif	//if TEST_INPUT_CAPTURE==0
-
+void sensorHandler(Sensor_t *sensor);
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
@@ -240,31 +149,29 @@ int main(void)
 #if DEBUG
 	bufLen = sprintf(buf, "%sF103 Lighthouse Firmware!\r\n=========================\r\n",
 			vt100_home);
-//	bufLen = sprintf(buf, "F103 Lighthouse Firmware!\r\n=========================\r\n");
 	serial_write_str(&debug, buf, bufLen);
 
 	serial_init(&debug);
 	HAL_Delay(500);
 	HAL_IWDG_Refresh(&hiwdg);
 	HAL_GPIO_WritePin(LED_BUILTIN_GPIO_Port, LED_BUILTIN_Pin, GPIO_PIN_RESET);
-//	bufLen = sprintf(buf, "done!\r\n=========================\r\n");
-//	serial_write_str(&debug, buf, bufLen);
 
 	serial_init(&debug);
 #endif	//if DEBUG
 
-#if TEST_INPUT_CAPTURE==0
-	sensor_init();
-#endif	//if TEST_INPUT_CAPTURE==0
+	for ( int i = 0; i < 4; i++ ) {
+		LSensor_begin(&sensor[i], i);
+		sensor_pulse_detected[i] = 0;
+	}
 
-	HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_1);
-	HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_2);
+//	HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_1);
+//	HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_2);
 	HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
 	HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
-	HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
-	HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2);
-	HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_1);
-	HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_2);
+//	HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
+//	HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2);
+//	HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_1);
+//	HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_2);
 
 	/* USER CODE END 2 */
 
@@ -272,22 +179,18 @@ int main(void)
 	/* USER CODE BEGIN WHILE */
 	uint32_t millis = 0;
 	uint32_t timer = 0;
-	uint32_t displayTimer = 0;
-
-#if TEST_INPUT_CAPTURE==0 && DEBUG==1
-	uint16_t ootxCounter = 0;
-#endif	//if TEST_INPUT_CAPTURE==0
 
 	while (1) {
-		float s[4][4];
-		uint8_t i, j;
-
 		millis = HAL_GetTick();
 		HAL_IWDG_Refresh(&hiwdg);
 		/* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
 		/* TODO BEGIN LOOP*/
+
+		for ( int i = 0; i < 4; i++ )
+			sensorHandler(&sensor[i]);
+
 		if (millis >= timer) {
 			timer = millis + 1000;
 
@@ -295,115 +198,10 @@ int main(void)
 				HAL_GPIO_WritePin(LED_BUILTIN_GPIO_Port, LED_BUILTIN_Pin, GPIO_PIN_SET);
 			else
 				HAL_GPIO_WritePin(LED_BUILTIN_GPIO_Port, LED_BUILTIN_Pin, GPIO_PIN_RESET);
-		}
-#if DEBUG
 
-#if TEST_INPUT_CAPTURE==0
-		sensorHandler();
-		if (millis >= displayTimer) {
-			displayTimer = millis + 100;
-
-			for ( i = 0; i < 4; i++ ) {
-				for ( j = 0; j < 4; j++ )
-					s[i][j] = sensorL[i].angles[j];
-			}
-
-			bufLen = sprintf(buf, "%slivetime= %d", vt100_lineX[3], (int) (millis / 1000));
-			serial_write_str(&debug, buf, bufLen);
-
-			bufLen = sprintf(buf, "%ssensor0:%s%.3f\t%.3f\t%.3f\t%.3f", vt100_lineX[5],
-					vt100_lineX[6], s[0][0], s[0][1], s[0][2], s[0][3]);
-			serial_write_str(&debug, buf, bufLen);
-			bufLen = sprintf(buf, "%ssensor1:%s%.3f\t%.3f\t%.3f\t%.3f", vt100_lineX[7],
-					vt100_lineX[8], s[1][0], s[1][1], s[1][2], s[1][3]);
-			serial_write_str(&debug, buf, bufLen);
-			bufLen = sprintf(buf, "%ssensor2:%s%.3f\t%.3f\t%.3f\t%.3f", vt100_lineX[9],
-					vt100_lineX[10], s[2][0], s[2][1], s[2][2], s[2][3]);
-			serial_write_str(&debug, buf, bufLen);
-			bufLen = sprintf(buf, "%ssensor3:%s%.3f\t%.3f\t%.3f\t%.3f", vt100_lineX[11],
-					vt100_lineX[12], s[3][0], s[3][1], s[3][2], s[3][3]);
-			serial_write_str(&debug, buf, bufLen);
-
-			bufLen = sprintf(buf, "%sDebug:%spulseInvalid= %d\tpreamble= %d | %d", vt100_lineX[15],
-					vt100_lineX[16], (int) pulse_invalid_counter, (int) ootx_preamble_counter,
-					(int) ootx_reset_counter);
-			serial_write_str(&debug, buf, bufLen);
-			bufLen = sprintf(buf, "%s%d\t%X", vt100_lineX[17],
-					(int) ootx[0].private.accumulator_bits, (int) ootx[0].private.accumulator);
-			serial_write_str(&debug, buf, bufLen);
-
-		}
-
-		if (ootx[1].completed > 0) {
-			bufLen = sprintf(buf, "%sootx counter= %d", vt100_lineX[20], ootxCounter++);
-			serial_write_str(&debug, buf, bufLen);
-
-			ootx[1].completed = 0;
-		}
-#endif	//if TEST_INPUT_CAPTURE==0
-
-#if TEST_INPUT_CAPTURE
-
-		if (inputCaptureFlag[0] == SET) {
-			inputCaptureFlag[0] = RESET;
-
-			bufLen = sprintf(buf, "%ss0= %d", vt100_lineX[3], (int) inputCaptureVal[0]);
-
+			bufLen = sprintf(buf, "%s%d", vt100_lineX[3], sensor_pulse_detected[1]);
 			serial_write_str(&debug, buf, bufLen);
 		}
-		else if (inputCaptureFlag[1] == SET) {
-			inputCaptureFlag[1] = RESET;
-
-			bufLen = sprintf(buf, "%ss1= %d", vt100_lineX[4], (int) inputCaptureVal[1]);
-
-			serial_write_str(&debug, buf, bufLen);
-		}
-		else if (inputCaptureFlag[2] == SET) {
-			inputCaptureFlag[2] = RESET;
-
-			bufLen = sprintf(buf, "%ss2= %d", vt100_lineX[5], (int) inputCaptureVal[2]);
-
-			serial_write_str(&debug, buf, bufLen);
-		}
-		else if (inputCaptureFlag[3] == SET) {
-			inputCaptureFlag[3] = RESET;
-
-			bufLen = sprintf(buf, "%ss3= %d", vt100_lineX[6], (int) inputCaptureVal[3]);
-
-			serial_write_str(&debug, buf, bufLen);
-		}
-		if (inputCaptureFlag[4] == SET) {
-			inputCaptureFlag[4] = RESET;
-
-			bufLen = sprintf(buf, "%ss4= %d", vt100_lineX[7], (int) inputCaptureVal[4]);
-
-			serial_write_str(&debug, buf, bufLen);
-		}
-		else if (inputCaptureFlag[5] == SET) {
-			inputCaptureFlag[5] = RESET;
-
-			bufLen = sprintf(buf, "%ss5= %d", vt100_lineX[8], (int) inputCaptureVal[5]);
-
-			serial_write_str(&debug, buf, bufLen);
-		}
-		else if (inputCaptureFlag[6] == SET) {
-			inputCaptureFlag[6] = RESET;
-
-			bufLen = sprintf(buf, "%ss6= %d", vt100_lineX[9], (int) inputCaptureVal[6]);
-
-			serial_write_str(&debug, buf, bufLen);
-		}
-		else if (inputCaptureFlag[7] == SET) {
-			inputCaptureFlag[7] = RESET;
-
-			bufLen = sprintf(buf, "%ss7= %d", vt100_lineX[10], (int) inputCaptureVal[7]);
-
-			serial_write_str(&debug, buf, bufLen);
-		}
-
-#endif	//if TEST_INPUT_CAPTURE
-#endif	//if DEBUG
-
 	}
 	/* USER CODE END 3 */
 
@@ -748,314 +546,24 @@ void USART3_IRQHandler(void)
 }
 #endif	//if DEBUG
 
-#if TEST_INPUT_CAPTURE==0
-
-static uint16_t findPulseLength(uint16_t start, uint16_t end)
+void sensorHandler(Sensor_t *sensor)
 {
-	uint16_t ret = 0;
-	if (end >= start)
-		ret = end - start;
-	else
-		ret = 0xFFFF - start + end;
+	char *line = vt100_lineX[5 + sensor->instance];
 
-	return ret;
-}
+	if (sensor_pulse_detected[sensor->instance] > 0) {
+		__disable_irq();
+		sensor_pulse_detected[sensor->instance]--;
+		__enable_irq();
 
-static bool findAngle(uint16_t nskip, uint16_t start, uint16_t end, float *angle)
-{
-	uint16_t _pulseStart = 0, _pulseEnd = 0;
-	float _pulseMid = 0.0f;
-	float _delta = 0.0f;
-
-	_pulseStart = findPulseLength(nskip, start);
-	_pulseEnd = findPulseLength(nskip, end);
-
-	if (_pulseStart >= 24000 || _pulseEnd >= 24000)
-		return false;
-
-	_pulseMid = (float) (_pulseStart + _pulseEnd) / 2;
-
-	/* 4000us -> 12000 ticks
-	 * 8333us -> 24999 ticks
-	 *
-	 */
-	_delta = _pulseMid - 12000.0;
-	if (fabs(_delta) > 12000.0)
-		return false;
-//	_delta = _pulseMid - 4000.0;
-//	if (fabs(_delta) > 4000.0)
-//		return false;
-
-//	*angle = _delta * M_PI / 24999.9;
-	*angle = _delta * 180.0 / 24999.9;
-//	*angle = _delta * 180.0 / 8333;
-
-	return true;
-}
-
-static void ootx_init(Lighthouse_OOTX_t *ootx)
-{
-	ootx_reset(&ootx->private);
-	ootx->completed = 0;
-	ootx->length = 0;
-	memset(ootx->bytes, 0, OOTX_BUFSIZE);
-}
-
-static void ootx_reset(Lighthouse_OOTX_Private_t *ootxPrivate)
-{
-	ootxPrivate->waiting_for_preamble = 1;
-	ootxPrivate->waiting_for_length = 1;
-	ootxPrivate->accumulator = 0;
-	ootxPrivate->accumulator_bits = 0;
-	ootxPrivate->rx_bytes = 0;
-	ootx_reset_counter++;
-}
-
-static void ootx_add_bit(Lighthouse_OOTX_t *ootx, uint8_t bit)
-{
-	Lighthouse_OOTX_Private_t *oPrivate = &ootx->private;
-
-	bit &= 0b1;
-
-	/* add this bit to our incoming word */
-	oPrivate->accumulator = (oPrivate->accumulator << 1) | bit;
-	oPrivate->accumulator_bits++;
-
-	if (oPrivate->waiting_for_preamble) {
-		/* 17 zeros, followed by a 1 == 18 bits */
-		if (oPrivate->accumulator_bits != 18)
-			return;
-
-		/* received preamble, start on data */
-		if (oPrivate->accumulator == 0b1) {
-			ootx_preamble_counter++;
-			/* first we'll need the length */
-			oPrivate->waiting_for_preamble = 0;
-			oPrivate->waiting_for_length = 1;
-			oPrivate->accumulator = 0;
-			oPrivate->accumulator_bits = 0;
-			return;
+		int ind = LSensor_poll(sensor);
+		if (ind > 0) {
+			bufLen = sprintf(buf, "%s%d-%d\t%.3f %.3f %.3f %.3f", line, sensor->instance, ind,
+					sensor->angles[0], sensor->angles[1], sensor->angles[2], sensor->angles[3]);
+			serial_write_str(&debug, buf, bufLen);
 		}
-		/* we've received 18 bits worth of preamble
-		 * but it isnt a valid thing. hold onto the
-		 * last 17 bits worth of data
-		 */
-		oPrivate->accumulator_bits--;
-		oPrivate->accumulator &= 0x1FFFF;
-		return;
+
 	}
 
-	/* we're receiving data!  accumulate until we get a sync bit */
-	if (oPrivate->accumulator_bits < 17)
-		return;
-
-	if ((oPrivate->accumulator & 0b1) == 0) {
-		/* no sync bit. go back into waiting for preamble mode */
-		ootx_reset(&ootx->private);
-		return;
-	}
-
-	/* hurrah!  the sync bit was set */
-	uint16_t _word = oPrivate->accumulator >> 1;
-	oPrivate->accumulator = 0;
-	oPrivate->accumulator_bits = 0;
-
-	ootx_add_word(ootx, _word);
-}
-
-static void ootx_add_word(Lighthouse_OOTX_t *ootx, uint16_t word)
-{
-	Lighthouse_OOTX_Private_t *oPrivate = &ootx->private;
-
-	if (oPrivate->waiting_for_length) {
-//		ootx->length = word + 4;	//add in the CRC32 length
-		ootx->length = (((word >> 8) & 0xFF) | ((word & 0xFF) << 8)) + 4;
-		oPrivate->padding = ootx->length & 1;
-		oPrivate->waiting_for_length = 0;
-		oPrivate->rx_bytes = 0;
-
-		/* error */
-		if (ootx->length > OOTX_BUFSIZE)
-			ootx_reset(&ootx->private);
-
-		return;
-	}
-
-	ootx->bytes[oPrivate->rx_bytes++] = (word >> 8) & 0xFF;
-	ootx->bytes[oPrivate->rx_bytes++] = word & 0xFF;
-
-	if (oPrivate->rx_bytes < ootx->length + oPrivate->padding)
-		return;
-
-	/* TODO check CRC32*/
-
-	ootx->completed = 1;
-
-	/* reset to wait for preamble */
-	ootx_reset(&ootx->private);
-}
-
-static void pulse_init(Pulse_Buffer_t *buffer)
-{
-	buffer->head = buffer->tail = 0;
-}
-
-static void pulse_write_rise(Pulse_Buffer_t *buffer, uint16_t time)
-{
-	if (bitRead(buffer->head, 0) == 0) {
-		buffer->timestamp[buffer->head] = time;
-		buffer->head = (buffer->head + 1) % PULSE_BUFSIZE;
-	}
-	/* else, ignore it and wait until we got pulse fall timestamp */
-}
-
-static void pulse_write_fall(Pulse_Buffer_t *buffer, uint16_t time)
-{
-	if (bitRead(buffer->head, 0) == 1) {
-		buffer->timestamp[buffer->head] = time;
-		buffer->head = (buffer->head + 1) % PULSE_BUFSIZE;
-	}
-}
-
-static bool pulse_buffer_available(Pulse_Buffer_t *buffer)
-{
-	uint16_t delta = 0;
-
-	if (buffer->head >= buffer->tail)
-		delta = buffer->head - buffer->tail;
-	else
-		delta = buffer->head + PULSE_BUFSIZE - buffer->tail;
-
-	if (delta > 1)
-		return true;
-
-	return false;
-}
-
-static bool pulse_read(Pulse_Buffer_t *buffer, uint16_t *rise, uint16_t *fall)
-{
-	if (pulse_buffer_available(buffer)) {
-		if (!bitRead(buffer->tail, 0)) {
-			*rise = buffer->timestamp[buffer->tail];
-			buffer->tail = (buffer->tail + 1) % PULSE_BUFSIZE;
-			*fall = buffer->timestamp[buffer->tail];
-			buffer->tail = (buffer->tail + 1) % PULSE_BUFSIZE;
-
-			return true;
-		}
-	}
-
-	return false;
-}
-
-static void sensor_init()
-{
-	for ( uint8_t i = 0; i < 4; i++ ) {
-		sensorL[i].instance = i;
-		pulse_init(&sensorL[i].pulse);
-		sensorL[i].state = 0;
-		ootx_init(&ootx[i]);
-		for ( uint8_t j = 0; j < 4; j++ )
-			sensorL[i].angles[j] = 0.0f;
-	}
-}
-
-static void sensorProcessing(Sensor_t *sensor)
-{
-	/* if there is a new pulse */
-	uint16_t _pulseLen = 0;
-	uint16_t timeRise = 0, timeFall = 0;
-	uint8_t i = 0;
-	uint8_t skip = 0, data = 0, axis = 0;
-	bool _pulseValid = false;
-	float _newAngles = 0.0f;
-
-	if (pulse_read(&sensor->pulse, &timeRise, &timeFall)) {
-		_pulseLen = findPulseLength(timeRise, timeFall);
-
-		/* sync pulse detected, hopefully */
-		if (_pulseLen > pulse_data_max) {
-			/* new sweep and data has been found */
-			if (bitRead(sensor->state, ST_SWEEP_GOT_DATA_BIT))
-				sensor->state = 0;
-
-			/* find type of sync pulse */
-			for ( i = 0; i < 8; i++ ) {
-				if ((_pulseLen >= pulse_midpoints[i] - pulse_margin)
-						&& (_pulseLen <= pulse_midpoints[i] + pulse_margin)) {
-					skip = (i >> 2) & 1;
-					data = (i >> 1) & 1;
-					axis = i & 1;
-					_pulseValid = true;
-					break;
-				}
-			}
-
-			/* sync pulse detected */
-			if (_pulseValid) {
-				/* sync pulse #1 */
-				if (bitRead(sensor->state,ST_SWEEP_START_BIT) == 0) {
-					if (skip)
-						bitSet(sensor->state, ST_SWEEP_SKIP_SYNC_BIT);
-					else {
-						bitSet(sensor->state, ST_SWEEP_NSKIP_SYNC_BIT);
-						sensor->startNskipPulse = timeRise;
-						sensor->id_tem = axis;
-					}
-					bitSet(sensor->state, ST_SWEEP_START_BIT);
-				}
-				/* sync pulse #2 */
-				else {
-					/* sync pulse #1 is skip */
-					if ((skip == 0) && bitRead(sensor->state, ST_SWEEP_SKIP_SYNC_BIT)) {
-						bitSet(sensor->state, ST_SWEEP_NSKIP_SYNC_BIT);
-						sensor->startNskipPulse = timeRise;
-						sensor->id_tem = axis | 0b10;
-						ootx_add_bit(&ootx[sensor->instance], data);
-					}
-					/* sync pulse #1 is nskip */
-					else if ((skip == 1) && bitRead(sensor->state, ST_SWEEP_NSKIP_SYNC_BIT))
-						bitSet(sensor->state, ST_SWEEP_SKIP_SYNC_BIT);
-					/* sync pulse #2 is invalid */
-					else
-						sensor->state = 0;
-				}
-			}	//if (_pulseValid)
-			else {
-				sensor->state = 0;
-				pulse_invalid_counter++;
-			}
-		}
-		/* data pulse detected */
-		else {
-			/* double sync pulse is already detected */
-			if (sensor->state & 0b111) {
-				/* if data pulse has not been found yet */
-				if (!bitRead(sensor->state, ST_SWEEP_GOT_DATA_BIT)) {
-					/* calculate angle */
-					if (findAngle(sensor->startNskipPulse, timeRise, timeFall, &_newAngles)) {
-//						sensor->angles[sensor->id_tem] = _newAngles;
-						sensor->angles[sensor->id_tem] = (sensor->angles[sensor->id_tem] * 0.75)
-								+ (_newAngles * 0.25);
-						bitSet(sensor->state, ST_SWEEP_GOT_DATA_BIT);
-						sensor->startDataPulse = timeRise;
-					}
-
-				}
-//					/* if data pulse has been found */
-//					else
-//						sensor->angles[sensor->id_tem] = findAngle(sensor->startNskipPulse,
-//								sensor->startDataPulse, timeFall);
-			}
-		}
-	}	//if (pulse_read(&sensor->pulse, &timeRise, &timeFall))
-
-}
-
-static void sensorHandler()
-{
-	for ( uint8_t i = 0; i < 4; i++ )
-		sensorProcessing(&sensorL[i]);
 }
 
 //void TIM1_IRQHandler(void)
@@ -1063,7 +571,7 @@ void TIM1_CC_IRQHandler(void)
 {
 	TIM_HandleTypeDef *htim = &htim1;
 	uint16_t _timestamp = htim->Instance->CNT;
-	Pulse_Buffer_t *pulseBuffer = &sensorL[0].pulse;
+	Sensor_t *sen = &sensor[0];
 
 	/* Capture compare 1 event */
 	if (__HAL_TIM_GET_FLAG(htim, TIM_FLAG_CC1) != RESET) {
@@ -1071,7 +579,7 @@ void TIM1_CC_IRQHandler(void)
 			{
 				__HAL_TIM_CLEAR_IT(htim, TIM_IT_CC1);
 				/* Input capture event */
-				pulse_write_rise(pulseBuffer, _timestamp);
+				LBuffer_write(&sen->icp_falling, _timestamp);
 			}
 		}
 	}
@@ -1080,7 +588,8 @@ void TIM1_CC_IRQHandler(void)
 		if (__HAL_TIM_GET_IT_SOURCE(htim, TIM_IT_CC2) != RESET) {
 			__HAL_TIM_CLEAR_IT(htim, TIM_IT_CC2);
 			/* Input capture event */
-			pulse_write_fall(pulseBuffer, _timestamp);
+			LBuffer_write(&sen->icp_rising, _timestamp);
+			sensor_pulse_detected[0]++;
 		}
 	}
 }
@@ -1090,19 +599,20 @@ void TIM2_IRQHandler(void)
 	TIM_HandleTypeDef *htim = &htim2;
 	uint32_t isrflags = READ_REG(htim->Instance->SR);
 	uint16_t _timestamp = htim->Instance->CNT;
-	Pulse_Buffer_t *pulseBuffer = &sensorL[1].pulse;
+	Sensor_t *sen = &sensor[1];
 
 	/* Capture compare 1 event */
 	if ((isrflags & TIM_FLAG_CC1) != RESET) {
 		__HAL_TIM_CLEAR_IT(htim, TIM_IT_CC1);
 		/* Input capture event */
-		pulse_write_rise(pulseBuffer, _timestamp);
+		LBuffer_write(&sen->icp_falling, _timestamp);
 	}
 	/* Capture compare 2 event */
 	if ((isrflags & TIM_FLAG_CC2) != RESET) {
 		__HAL_TIM_CLEAR_IT(htim, TIM_IT_CC2);
 		/* Input capture event */
-		pulse_write_fall(pulseBuffer, _timestamp);
+		LBuffer_write(&sen->icp_rising, _timestamp);
+		sensor_pulse_detected[1]++;
 	}
 }
 
@@ -1111,19 +621,20 @@ void TIM3_IRQHandler(void)
 	TIM_HandleTypeDef *htim = &htim3;
 	uint32_t isrflags = READ_REG(htim->Instance->SR);
 	uint16_t _timestamp = htim->Instance->CNT;
-	Pulse_Buffer_t *pulseBuffer = &sensorL[2].pulse;
+	Sensor_t *sen = &sensor[2];
 
 	/* Capture compare 1 event */
 	if ((isrflags & TIM_FLAG_CC1) != RESET) {
 		__HAL_TIM_CLEAR_IT(htim, TIM_IT_CC1);
 		/* Input capture event */
-		pulse_write_rise(pulseBuffer, _timestamp);
+		LBuffer_write(&sen->icp_falling, _timestamp);
 	}
 	/* Capture compare 2 event */
 	if ((isrflags & TIM_FLAG_CC2) != RESET) {
 		__HAL_TIM_CLEAR_IT(htim, TIM_IT_CC2);
 		/* Input capture event */
-		pulse_write_fall(pulseBuffer, _timestamp);
+		LBuffer_write(&sen->icp_rising, _timestamp);
+		sensor_pulse_detected[2]++;
 	}
 }
 
@@ -1132,75 +643,22 @@ void TIM4_IRQHandler(void)
 	TIM_HandleTypeDef *htim = &htim4;
 	uint32_t isrflags = READ_REG(htim->Instance->SR);
 	uint16_t _timestamp = htim->Instance->CNT;
-	Pulse_Buffer_t *pulseBuffer = &sensorL[3].pulse;
+	Sensor_t *sen = &sensor[3];
 
 	/* Capture compare 1 event */
 	if ((isrflags & TIM_FLAG_CC1) != RESET) {
 		__HAL_TIM_CLEAR_IT(htim, TIM_IT_CC1);
 		/* Input capture event */
-		pulse_write_rise(pulseBuffer, _timestamp);
+		LBuffer_write(&sen->icp_falling, _timestamp);
 	}
 	/* Capture compare 2 event */
 	if ((isrflags & TIM_FLAG_CC2) != RESET) {
 		__HAL_TIM_CLEAR_IT(htim, TIM_IT_CC2);
 		/* Input capture event */
-		pulse_write_fall(pulseBuffer, _timestamp);
+		LBuffer_write(&sen->icp_rising, _timestamp);
+		sensor_pulse_detected[3]++;
 	}
 }
-
-#endif	//if TEST_INPUT_CAPTURE==0
-
-#if TEST_INPUT_CAPTURE
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
-{
-	uint32_t _timestamp = htim->Instance->CNT;
-	htim->Instance->CNT = 0;
-
-	if (htim->Instance == TIM1) {
-		if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-			inputCaptureVal[0] = _timestamp;
-			inputCaptureFlag[0] = SET;
-		}
-		else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
-			inputCaptureVal[1] = _timestamp;
-			inputCaptureFlag[1] = SET;
-		}
-	}
-
-	if (htim->Instance == TIM2) {
-		if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-			inputCaptureVal[2] = _timestamp;
-			inputCaptureFlag[2] = SET;
-		}
-		else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
-			inputCaptureVal[3] = _timestamp;
-			inputCaptureFlag[3] = SET;
-		}
-	}
-
-	if (htim->Instance == TIM3) {
-		if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-			inputCaptureVal[4] = _timestamp;
-			inputCaptureFlag[4] = SET;
-		}
-		else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
-			inputCaptureVal[5] = _timestamp;
-			inputCaptureFlag[5] = SET;
-		}
-	}
-
-	if (htim->Instance == TIM4) {
-		if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-			inputCaptureVal[6] = _timestamp;
-			inputCaptureFlag[6] = SET;
-		}
-		else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
-			inputCaptureVal[7] = _timestamp;
-			inputCaptureFlag[7] = SET;
-		}
-	}
-}
-#endif	//if TEST_INPUT_CAPTURE
 
 /* TODO End of Function Declarations*/
 /* USER CODE END 4 */
